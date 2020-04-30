@@ -16,6 +16,7 @@
 #include <slibc/string.h>
 #else
 #include "safe_str_lib.h"
+#define snprintf_s snprintf
 #endif
 
 #include "dwpal_ext.h"
@@ -26,7 +27,6 @@
 
 #define PING_CHECK_TIME 3
 #define RECOVERY_RETRY_TIME 1
-#define COMMAND_ENDED_SOCKET "/tmp/dwpal_command_get_ended_socket"
 #define EVENT_HANDLER_SOCKET "/tmp/dwpal_event_handler_socket"
 
 
@@ -63,8 +63,17 @@ bool isCliPrintf = false;
 
 static DwpalService *dwpalService[NUM_OF_SUPPORTED_VAPS + 1] = { [0 ... NUM_OF_SUPPORTED_VAPS ] = NULL };  /* add 1 place for NL */
 static void *context[sizeof(dwpalService) / sizeof(DwpalService *)]= { [0 ... (sizeof(dwpalService) / sizeof(DwpalService *) - 1) ] = NULL };
-static int dwpal_command_get_ended = (-1);
 static pthread_t listenerThreadId = (pthread_t)0;
+static int listenerThreadShouldStop = 0, listenerThreadPipeFds[2] = { 0 };
+static pthread_mutex_t context_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t attach_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static pthread_mutex_t nl_cmd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static unsigned char *nl_response_data = NULL;
+static size_t *nl_response_len = NULL;
+static bool nl_response_received = false;
+static bool nl_response_save_data = false;
+
 #if defined EVENT_CALLBACK_THREAD
 static int dwpal_event_handler = (-1);
 static pthread_t eventHandlerThreadId = (pthread_t)0;
@@ -104,9 +113,18 @@ static DWPAL_Ret interfaceIndexCreate(char *interfaceType, char *VAPName, int *i
 
 	if (interfaceIndexGet(interfaceType, VAPName, idx) == DWPAL_SUCCESS)
 	{
-		console_printf("%s; the interface (interfaceType= '%s', VAPName= '%s') is already exist ==> cont...\n",
+		console_printf("%s; the interface's database (interfaceType= '%s', VAPName= '%s') is already exist ==> check if the interface is already up\n",
 		            __FUNCTION__, interfaceType, VAPName);
-		return DWPAL_INTERFACE_ALREADY_UP;
+
+		/* Even if 'idx' already exist, the attach may have failed ==> check if the attach succeeded */
+		if (context[*idx] == NULL)
+		{  /* the attach failed, meaning the interface is down but the rest of 'dwpalService' is ready */
+			return DWPAL_SUCCESS;
+		}
+		else
+		{  /* the attach succeeded, meaning the interface is already up */
+			return DWPAL_INTERFACE_ALREADY_UP;
+		}
 	}
 
 	/* Getting here means that the interface does NOT exist ==> create it! */
@@ -137,13 +155,13 @@ static DWPAL_Ret interfaceIndexCreate(char *interfaceType, char *VAPName, int *i
 
 static bool isAnyInterfaceActive(void)
 {
-	int i, numOfServices = sizeof(dwpalService) / sizeof(DwpalService *);;
+	int i, numOfServices = sizeof(dwpalService) / sizeof(DwpalService *);
 
 	/* check if there are active interfaces */
 	for (i=0; i < numOfServices; i++)
 	{
 		/* In case that there is a valid context, break! */
-		if (context[i] != NULL)
+		if (dwpalService[i] != NULL)
 		{
 			return true;
 		}
@@ -153,6 +171,7 @@ static bool isAnyInterfaceActive(void)
 }
 
 
+#if defined EVENT_CALLBACK_THREAD
 static DWPAL_Ret socket_data_send(char *socketPrefixName, char *data, size_t size)
 {
     int                fd = -1, byte;
@@ -174,7 +193,7 @@ static DWPAL_Ret socket_data_send(char *socketPrefixName, char *data, size_t siz
 	memset(&un, 0, sizeof(un));
 	un.sun_family = AF_UNIX;
 
-	snprintf(socketName, sizeof(socketName) - 1, "%s_%d", socketPrefixName, pid);
+	snprintf_s(socketName, sizeof(socketName), "%s_%d", socketPrefixName, pid);
 	strcpy_s(un.sun_path, sizeof(un.sun_path), socketName);
 	len = offsetof(struct sockaddr_un, sun_path) + strnlen_s(socketName, sizeof(socketName));
 
@@ -214,11 +233,13 @@ static DWPAL_Ret socket_data_send(char *socketPrefixName, char *data, size_t siz
 
 	return DWPAL_SUCCESS;
 }
+#endif
 
 
 static void interfacesRecoverIfNeeded(void)
 {
 	int  i, numOfServices = sizeof(dwpalService) / sizeof(DwpalService *);
+	DWPAL_Ret ret;
 
 	//console_printf("%s Entry\n", __FUNCTION__);
 
@@ -234,7 +255,11 @@ static void interfacesRecoverIfNeeded(void)
 		if ( (!strncmp(dwpalService[i]->interfaceType, "hostap", 7)) &&
 		     (dwpalService[i]->isConnectionEstablishNeeded == true) )
 		{
-			if (dwpal_hostap_interface_attach(&context[i] /*OUT*/, dwpalService[i]->VAPName, NULL /*use one-way interface*/) == DWPAL_SUCCESS)
+			pthread_mutex_lock(&context_mutex);
+			ret = dwpal_hostap_interface_attach(&context[i] /*OUT*/, dwpalService[i]->VAPName, NULL /*use one-way interface*/);
+			pthread_mutex_unlock(&context_mutex);
+
+			if (ret == DWPAL_SUCCESS)
 			{
 				console_printf("%s; VAPName= '%s' interface recovered successfully!\n", __FUNCTION__, dwpalService[i]->VAPName);
 				dwpalService[i]->isConnectionEstablishNeeded = false;
@@ -266,8 +291,9 @@ static void interfacesRecoverIfNeeded(void)
 
 static void interfacesPingCheck(void)
 {
-	int  i, numOfServices = sizeof(dwpalService) / sizeof(DwpalService *);
-	bool isExist;
+	int    i, numOfServices = sizeof(dwpalService) / sizeof(DwpalService *);
+	char   reply[HOSTAPD_TO_DWPAL_SHORT_REPLY_LENGTH];
+	size_t replyLen = sizeof(reply) - 1;
 
 	//console_printf("%s Entry\n", __FUNCTION__);
 
@@ -279,29 +305,25 @@ static void interfacesPingCheck(void)
 			continue;
 		}
 
-		if (!strncmp(dwpalService[i]->interfaceType, "hostap", 7))
+		if (!strncmp(dwpalService[i]->interfaceType, "hostap", sizeof("hostap") - 1))
 		{
 			if (dwpalService[i]->fd > 0)
 			{
 				/* check if interface that should exist, still exists */
-				if (dwpal_hostap_is_socket_alive(context[i], &isExist /*OUT*/) == DWPAL_FAILURE)
-				{
-					console_printf("%s; dwpal_hostap_is_socket_alive for VAPName= '%s' error ==> cont...\n", __FUNCTION__, dwpalService[i]->VAPName);
-					continue;
-				}
-
-				if (isExist == false)
+				if (dwpal_ext_hostap_cmd_send(dwpalService[i]->VAPName, "PING", NULL, reply, &replyLen) == DWPAL_FAILURE)
 				{
 					console_printf("%s; VAPName= '%s' interface needs to be recovered\n", __FUNCTION__, dwpalService[i]->VAPName);
 
-					/* Close 'wpaCtrlPtr' and if needed also 'listenerWpaCtrlPtr', and free 'context' */
-					if (dwpal_hostap_socket_close(&context[i]) == DWPAL_FAILURE)
-					{
-						console_printf("%s; dwpal_hostap_socket_close returned error ==> cont...\n", __FUNCTION__);
-					}
-
 					dwpalService[i]->isConnectionEstablishNeeded = true;
 					dwpalService[i]->fd = -1;
+
+					pthread_mutex_lock(&context_mutex);
+					/* Close 'wpaCtrlPtr', and free 'context' */
+					if (context[i] != NULL && dwpal_hostap_interface_detach(&context[i]) == DWPAL_FAILURE)
+					{
+						console_printf("%s; dwpal_hostap_interface_detach (VAPName= '%s') returned ERROR ==> cont...\n", __FUNCTION__, dwpalService[i]->VAPName);
+					}
+					pthread_mutex_unlock(&context_mutex);
 				}
 			}
 		}
@@ -391,15 +413,17 @@ static void *listenerThreadStart(void *temp)
 	console_printf("%s Entry\n", __FUNCTION__);
 
 	/* Receive the msg */
-	while (true)
+	while (!listenerThreadShouldStop)
 	{
 		FD_ZERO(&rfds);
-		highestValFD = 0;
+
+		FD_SET(listenerThreadPipeFds[0], &rfds);
+		highestValFD = listenerThreadPipeFds[0];
 
 		for (i=0; i < numOfServices; i++)
 		{
-			/* In case that there is no valid context, continue... */
-			if (context[i] == NULL)
+			/* In case that there is no valid context, or no valid service, continue... */
+			if ( (context[i] == NULL) || (dwpalService[i] == NULL) )
 			{
 				continue;
 			}
@@ -433,12 +457,6 @@ static void *listenerThreadStart(void *temp)
 					FD_SET(dwpalService[i]->fd, &rfds);
 					highestValFD = (dwpalService[i]->fd > highestValFD)? dwpalService[i]->fd : highestValFD;  /* find the highest value fd */
 				}
-
-				if (dwpalService[i]->fdCmdGet > 0)
-				{
-					FD_SET(dwpalService[i]->fdCmdGet, &rfds);
-					highestValFD = (dwpalService[i]->fdCmdGet > highestValFD)? dwpalService[i]->fdCmdGet : highestValFD;  /* find the highest value fd */
-				}
 			}
 		}
 
@@ -457,10 +475,23 @@ static void *listenerThreadStart(void *temp)
 			continue;
 		}
 
+		if (FD_ISSET(listenerThreadPipeFds[0], &rfds))
+		{
+			char pipedMsg[16];
+
+			console_printf("%s; received message from main thread => shutting down\n", __FUNCTION__);
+
+			if ((ret = read(listenerThreadPipeFds[0], pipedMsg, sizeof(pipedMsg))) < 0)
+			{
+				console_printf("%s; read() return value= %d ==> cont...; errno= %d ('%s')\n", __FUNCTION__, ret, errno, strerror(errno));
+			}
+			break;
+		}
+
 		for (i=0; i < numOfServices; i++)
 		{
-			/* In case that there is no valid context, continue... */
-			if (context[i] == NULL)
+			/* In case that there is no valid context, or no valid service, continue... */
+			if ( (context[i] == NULL) || (dwpalService[i] == NULL) )
 			{
 				continue;
 			}
@@ -518,7 +549,10 @@ static void *listenerThreadStart(void *temp)
 									console_printf("%s; socket_data_send failed ==> cont...\n", __FUNCTION__);
 								}
 #else
-								dwpalService[i]->hostapEventCallback(dwpalService[i]->VAPName, opCode, msg, msgStringLen);
+								if (dwpalService[i]->hostapEventCallback != NULL)
+								{
+									dwpalService[i]->hostapEventCallback(dwpalService[i]->VAPName, opCode, msg, msgStringLen);
+								}
 #endif
 							}
 						}
@@ -535,16 +569,6 @@ static void *listenerThreadStart(void *temp)
 						   __FUNCTION__, dwpalService[i]->interfaceType, dwpalService[i]->VAPName);
 
 					if (dwpal_driver_nl_msg_get(context[i], DWPAL_NL_UNSOLICITED_EVENT, dwpalService[i]->nlEventCallback, dwpalService[i]->nlNonVendorEventCallback) == DWPAL_FAILURE)
-					{
-						console_printf("%s; dwpal_driver_nl_msg_get ERROR\n", __FUNCTION__);
-					}
-				}
-				else if ( (dwpalService[i]->fdCmdGet > 0) && (FD_ISSET(dwpalService[i]->fdCmdGet, &rfds)) )
-				{
-					console_printf("%s; 'get command' event received; interfaceType= '%s', VAPName= '%s'\n",
-						   __FUNCTION__, dwpalService[i]->interfaceType, dwpalService[i]->VAPName);
-
-					if (dwpal_driver_nl_msg_get(context[i], DWPAL_NL_SOLICITED_EVENT, dwpalService[i]->nlCmdGetCallback, NULL) == DWPAL_FAILURE)
 					{
 						console_printf("%s; dwpal_driver_nl_msg_get ERROR\n", __FUNCTION__);
 					}
@@ -566,6 +590,7 @@ static void *listenerThreadStart(void *temp)
 		}
 	}
 
+	console_printf("%s; exit\n");
 	return NULL;
 }
 
@@ -587,6 +612,13 @@ static DWPAL_Ret listenerThreadCreate(pthread_t *thread_id, ThreadEntryFunc thre
 		return DWPAL_FAILURE;
 	}
 
+	if (pipe(listenerThreadPipeFds) == -1)
+	{
+		console_printf("%s; pipe ERROR (errno= %d) ==> Abort!\n", __FUNCTION__, errno);
+		pthread_attr_destroy(&attr);
+		return DWPAL_FAILURE;
+	}
+
 	ret = pthread_attr_setstacksize(&attr, stack_size);
 	if (ret == -1)
 	{
@@ -596,6 +628,8 @@ static DWPAL_Ret listenerThreadCreate(pthread_t *thread_id, ThreadEntryFunc thre
 
 	if (dwpalRet == DWPAL_SUCCESS)
 	{
+		listenerThreadShouldStop = 0; /* must be 0 before creating the listener Thread */
+
 		console_printf("%s; call pthread_create\n", __FUNCTION__);
 		ret = pthread_create(thread_id, &attr, threadEntryFunc, NULL /*can be used to send params*/);
 		if (ret != 0)
@@ -620,6 +654,18 @@ static DWPAL_Ret listenerThreadCreate(pthread_t *thread_id, ThreadEntryFunc thre
 
 			free(res);  /* Free memory allocated by thread */
 #endif
+		}
+	}
+
+	if (dwpalRet != DWPAL_SUCCESS)
+	{
+		if (close(listenerThreadPipeFds[0]) != 0)
+		{
+			console_printf("%s; close() to listenerThreadPipeFds[0] FAILED (errno= %d)\n", __FUNCTION__, errno);
+		}
+		if (close(listenerThreadPipeFds[1]) != 0)
+		{
+			console_printf("%s; close() to listenerThreadPipeFds[1] FAILED (errno= %d)\n", __FUNCTION__, errno);
 		}
 	}
 
@@ -659,9 +705,29 @@ static DWPAL_Ret threadSet(pthread_t *thread_id, DwpalThreadOperation threadOper
 		case THREAD_CANCEL:
 			if (*thread_id != 0)
 			{
-				if ( (ret = pthread_cancel(*thread_id)) != 0 )
+				/* tell the listener Thread to stop, both with flag, and message */
+				listenerThreadShouldStop = 1;
+				if (write(listenerThreadPipeFds[1], "CANCEL", sizeof("CANCEL")) < 0)
 				{
-					console_printf("%s; pthread_attr_destroy ERROR (ret= %d) ==> Abort!\n", __FUNCTION__, ret);
+					console_printf("%s; write to listenerThreadPipeFds[1] FAILED (errno= %d)\n", __FUNCTION__, errno);
+				}
+
+				console_printf("%s; before pthread_join\n", __FUNCTION__);
+				ret = pthread_join(*thread_id, NULL);
+				console_printf("%s; after pthread_join\n", __FUNCTION__);
+
+				if (close(listenerThreadPipeFds[0]) != 0)
+				{
+					console_printf("%s; close() to listenerThreadPipeFds[0] FAILED (errno= %d)\n", __FUNCTION__, errno);
+				}
+				if (close(listenerThreadPipeFds[1]) != 0)
+				{
+					console_printf("%s; close() to listenerThreadPipeFds[1] FAILED (errno= %d)\n", __FUNCTION__, errno);
+				}
+
+				if (ret != 0 && ret != ESRCH)
+				{
+					console_printf("%s;pthread_join ERROR (ret= %d) ==> Abort!\n", __FUNCTION__, ret);
 					return DWPAL_FAILURE;
 				}
 
@@ -679,87 +745,7 @@ static DWPAL_Ret threadSet(pthread_t *thread_id, DwpalThreadOperation threadOper
 }
 
 
-static DWPAL_Ret dwpal_command_get_ended_socket_wait(bool *isReceived, size_t *outLen, unsigned char *outData)
-{
-	int    res, clientfd = -1, byte;
-	fd_set rfds;
-	size_t len;
-	struct timeval tv;
-	struct sockaddr_un un;
-
-	if ( (isReceived == NULL) || (outLen == NULL) || (outData == NULL) )
-	{
-		console_printf("%s; isReceived and/or outLen and/or outData is NULL ==> Abort!\n", __FUNCTION__);
-		return DWPAL_FAILURE;
-	}
-
-	if (dwpal_command_get_ended <= 0)
-	{
-		console_printf("%s; dwpal_command_get_ended= %d ==> Abort!\n", __FUNCTION__, dwpal_command_get_ended);
-		return DWPAL_FAILURE;
-	}
-
-	*outLen = 0;
-	*isReceived = false;
-
-	/* Receive the msg */
-	while (true)
-	{
-		FD_ZERO(&rfds);
-		FD_SET(dwpal_command_get_ended, &rfds);
-
-		tv.tv_sec = 1;
-		tv.tv_usec = 0;
-
-		res = select(dwpal_command_get_ended + 1, &rfds, NULL, NULL, &tv);
-		if (res < 0)
-		{
-			console_printf("%s; select() return value= %d ==> cont...; errno= %d ('%s') ==> expected behavior when 'Interrupted system call'\n", __FUNCTION__, res, errno, strerror(errno));
-			continue;
-		}
-
-		if (FD_ISSET(dwpal_command_get_ended, &rfds))
-		{  /* the select() was triggered due to the above daemon fd */
-			len = sizeof(un);
-			if ((clientfd = accept(dwpal_command_get_ended, (struct sockaddr *)&un, &len)) < 0)
-			{  /* wait for client to be connected to me (server) */
-				console_printf("%s; ERROR: accept() received; errno= %d ('%s') ==> cont...\n", __FUNCTION__, errno, strerror(errno));
-				continue;
-			}
-
-			console_printf("%s; right event indication received ==> break\n", __FUNCTION__);
-			byte = read(clientfd, (char *)outData, DRIVER_NL_TO_DWPAL_MSG_LENGTH);
-			if ( (byte == -1) || (byte > DRIVER_NL_TO_DWPAL_MSG_LENGTH) || (byte < 1) )
-			{   // wait for client to write/send data to me (server)
-				console_printf("%s; read() fail; errno= %d ('%s')\n", __FUNCTION__, errno, strerror(errno));
-
-				if (close(clientfd) == (-1))
-				{
-					console_printf("%s; close() fail; clientfd= %d; errno= %d ('%s')\n", __FUNCTION__, clientfd, errno, strerror(errno));
-				}
-
-				continue;
-			}
-
-			*outLen = (size_t)byte;
-			*isReceived = true;
-
-			if (close(clientfd) == (-1))
-			{
-				console_printf("%s; close() fail; clientfd= %d; errno= %d ('%s')\n", __FUNCTION__, clientfd, errno, strerror(errno));
-			}
-
-			break;
-		}
-
-		console_printf("%s; the right event indication was NOT received ==> break\n", __FUNCTION__);
-		break;
-	}
-
-	return DWPAL_SUCCESS;
-}
-
-
+#if defined EVENT_CALLBACK_THREAD
 static int fdDaemonSet(char *socketName, int *fd /* output param */)
 {
 	struct sockaddr_un un;
@@ -827,7 +813,7 @@ static DWPAL_Ret dwpal_socket_create(int *fd, char *socketPrefixName)
 	pid_t pid = getpid();
 	char  socketName[SOCKET_NAME_LENGTH] = "\0";
 
-	snprintf(socketName, sizeof(socketName) - 1, "%s_%d", socketPrefixName, pid);
+	snprintf_s(socketName, sizeof(socketName), "%s_%d", socketPrefixName, pid);
 
 	if (*fd > 0)
 	{
@@ -843,6 +829,7 @@ static DWPAL_Ret dwpal_socket_create(int *fd, char *socketPrefixName)
 
 	return DWPAL_SUCCESS;
 }
+#endif
 
 
 static DWPAL_Ret nlCmdGetCallback(char *ifname, int event, int subevent, size_t len, unsigned char *data)
@@ -871,10 +858,142 @@ static DWPAL_Ret nlCmdGetCallback(char *ifname, int event, int subevent, size_t 
 		console_printf("\n");
 	}
 
-	console_printf("%s; 'get command' (event= %d) was received ==> notify dwpal_ext\n", __FUNCTION__, event);
-	if (socket_data_send(COMMAND_ENDED_SOCKET, (char *)data, len) == DWPAL_FAILURE)
+	if (nl_response_save_data == true)
 	{
-		console_printf("%s; socket_data_send failed ==> cont...\n", __FUNCTION__);
+		if (nl_response_data == NULL || nl_response_len == NULL)
+		{
+			console_printf("%s; nl_response_data or nl_response_len is NULL ==> Abort!\n", __FUNCTION__);
+			return DWPAL_FAILURE;
+		}
+
+		if (len > DRIVER_NL_TO_DWPAL_MSG_LENGTH)
+		{
+			console_printf("%s; len (%d) > (%d) ==> Abort!\n", __FUNCTION__, len, DRIVER_NL_TO_DWPAL_MSG_LENGTH);
+			return DWPAL_FAILURE;
+		}
+
+		memcpy(nl_response_data, data, len);
+		*nl_response_len = len;
+		nl_response_received = true;
+	}
+
+	return DWPAL_SUCCESS;
+}
+
+
+static DWPAL_Ret nl_cmd_socket_clean_if_needed(int idx)
+{
+	struct  timeval tv;
+	fd_set  rfds;
+	int     ret;
+
+	if (dwpal_driver_nl_fd_get(context[idx], &dwpalService[idx]->fd, &dwpalService[idx]->fdCmdGet) == DWPAL_FAILURE)
+	{
+		console_printf("%s; dwpal_driver_nl_fd_get returned error ==> Abort.\n", __FUNCTION__);
+		return DWPAL_FAILURE;
+	}
+
+	if (dwpalService[idx]->fdCmdGet <= 0)
+	{
+		console_printf("%s; fdCmdGet value is invalid (%d) ==> Abort!\n", __FUNCTION__, dwpalService[idx]->fdCmdGet);
+		return DWPAL_FAILURE;
+	}
+
+	do {
+		int select_failure_count = 0;
+
+		FD_ZERO(&rfds);
+		FD_SET(dwpalService[idx]->fdCmdGet, &rfds);
+
+		tv.tv_sec = 0;
+		tv.tv_usec = 0;
+
+		ret = select(dwpalService[idx]->fdCmdGet + 1, &rfds, NULL, NULL, &tv);
+		if (ret < 0)
+		{
+			console_printf("%s; select() return value= %d ==> cont...; errno= %d ('%s')\n", __FUNCTION__, ret, errno, strerror(errno));
+			select_failure_count++;
+
+			if (select_failure_count == 3)
+			{
+				console_printf("%s; select() returned error %d times in a row ==> Abort.\n", __FUNCTION__, select_failure_count);
+				return DWPAL_FAILURE;
+			}
+
+			usleep(1000);
+			continue;
+		}
+
+		if (FD_ISSET(dwpalService[idx]->fdCmdGet, &rfds))
+		{
+			console_printf("%s; nl command socket not empty ==> receive one message\n", __FUNCTION__);
+
+			nl_response_save_data = false;
+			if (dwpal_driver_nl_msg_get(context[idx], DWPAL_NL_SOLICITED_EVENT, dwpalService[idx]->nlCmdGetCallback, NULL) == DWPAL_FAILURE)
+			{
+				console_printf("%s; dwpal_driver_nl_msg_get ERROR\n", __FUNCTION__);
+				return DWPAL_FAILURE;
+			}
+		}
+
+	} while(ret);
+
+	return DWPAL_SUCCESS;
+}
+
+
+static DWPAL_Ret nl_cmd_socket_receive_response(int idx, size_t *outLen, unsigned char *outData)
+{
+	struct  timeval tv;
+	fd_set  rfds;
+	int     ret;
+
+	if (dwpal_driver_nl_fd_get(context[idx], &dwpalService[idx]->fd, &dwpalService[idx]->fdCmdGet) == DWPAL_FAILURE)
+	{
+		console_printf("%s; dwpal_driver_nl_fd_get returned error ==> Abort.\n", __FUNCTION__);
+		return DWPAL_FAILURE;
+	}
+
+	if (dwpalService[idx]->fdCmdGet <= 0)
+	{
+		console_printf("%s; fdCmdGet value is invalid (%d) ==> Abort!\n", __FUNCTION__, dwpalService[idx]->fdCmdGet);
+		return DWPAL_FAILURE;
+	}
+
+recv:
+	FD_ZERO(&rfds);
+	FD_SET(dwpalService[idx]->fdCmdGet, &rfds);
+
+	tv.tv_sec = 2;
+	tv.tv_usec = 0;
+
+	ret = select(dwpalService[idx]->fdCmdGet + 1, &rfds, NULL, NULL, &tv);
+	if (ret < 0)
+	{
+		console_printf("%s; select() return value= %d ==> cont...; errno= %d ('%s') ==> expected behavior when 'Interrupted system call'\n", __FUNCTION__, ret, errno, strerror(errno));
+		usleep(1000);
+		goto recv;
+	}
+
+	if (FD_ISSET(dwpalService[idx]->fdCmdGet, &rfds))
+	{
+		console_printf("%s; nl command socket not empty ==> receive one message\n", __FUNCTION__);
+
+		nl_response_save_data = true;
+		nl_response_data = outData;
+		nl_response_len = outLen;
+		nl_response_received = false;
+		if (dwpal_driver_nl_msg_get(context[idx], DWPAL_NL_SOLICITED_EVENT, dwpalService[idx]->nlCmdGetCallback, NULL) == DWPAL_FAILURE)
+		{
+			console_printf("%s; dwpal_driver_nl_msg_get ERROR\n", __FUNCTION__);
+			return DWPAL_FAILURE;
+		}
+
+		if (nl_response_received == false)
+		{
+			console_printf("%s; nlCmdGetCallback did not fill outData with a response\n", __FUNCTION__);
+			return DWPAL_FAILURE;
+		}
 	}
 
 	return DWPAL_SUCCESS;
@@ -891,7 +1010,6 @@ static DWPAL_Ret nl_cmd_handle(char *ifname,
 							   unsigned char *outData)
 {
 	int    i, idx;
-	bool   isReceived = false;
 
 	console_printf("%s; ifname= '%s', nl80211Command= 0x%x, cmdIdType= %d, subCommand= 0x%x, vendorDataSize= %d, outLen= 0x%x, outData= 0x%x\n",
 	            __FUNCTION__, ifname, nl80211Command, cmdIdType, subCommand, vendorDataSize, (unsigned int)outLen, (unsigned int)outData);
@@ -911,6 +1029,14 @@ static DWPAL_Ret nl_cmd_handle(char *ifname,
 
 	if ( (outLen != NULL) && (outData != NULL) )
 	{
+		pthread_mutex_lock(&nl_cmd_mutex);
+
+		if (nl_cmd_socket_clean_if_needed(idx) == DWPAL_FAILURE)
+		{
+			console_printf("%s; nl_cmd_socket_clean_if_needed returned ERROR ==> Abort!\n", __FUNCTION__);
+			goto cmd_err;
+		}
+
 		/* Handle a command which invokes an event with the output data */
 		if (dwpal_driver_nl_cmd_send(context[idx],
 									 DWPAL_NL_SOLICITED_EVENT,
@@ -922,28 +1048,25 @@ static DWPAL_Ret nl_cmd_handle(char *ifname,
 									 vendorDataSize) == DWPAL_FAILURE)
 		{
 			console_printf("%s; dwpal_driver_nl_cmd_send returned ERROR ==> Abort!\n", __FUNCTION__);
-			return DWPAL_FAILURE;
+			goto cmd_err;
 		}
 
-		if (dwpal_command_get_ended_socket_wait(&isReceived, outLen, outData) == DWPAL_FAILURE)
+		if (nl_cmd_socket_receive_response(idx, outLen, outData) == DWPAL_FAILURE)
 		{
-			console_printf("%s; dwpal_command_get_ended_socket_wait ERROR (subCommand= 0x%x) ==> Abort!\n", __FUNCTION__, subCommand);
-			*outLen = 0;
-			return DWPAL_FAILURE;
+			console_printf("%s; nl_cmd_socket_receive_response ERROR (subCommand= 0x%x) ==> Abort!\n", __FUNCTION__, subCommand);
+			goto cmd_err;
 		}
 
-		if (isReceived == true)
-		{
-			console_printf("%s; 'get command' (subCommand= 0x%x, outLen= %d) was received\n", __FUNCTION__, subCommand, *outLen);
-		}
-		else
-		{
-			console_printf("%s; 'get command' (subCommand= 0x%x) was NOT received ==> Abort!\n", __FUNCTION__, subCommand);
-			*outLen = 0;
-			return DWPAL_FAILURE;
-		}
+		console_printf("%s; 'get command' (subCommand= 0x%x, outLen= %d) was received\n", __FUNCTION__, subCommand, *outLen);
+		pthread_mutex_unlock(&nl_cmd_mutex);
 
 		return DWPAL_SUCCESS;
+
+cmd_err:
+	*outLen = 0;
+	pthread_mutex_unlock(&nl_cmd_mutex);
+	return DWPAL_FAILURE;
+
 	}
 	else
 	{
@@ -1067,36 +1190,19 @@ DWPAL_Ret dwpal_ext_driver_nl_cmd_send(char *ifname, unsigned int nl80211Command
 DWPAL_Ret dwpal_ext_driver_nl_detach(void)
 {
 	int idx;
+	DWPAL_Ret ret;
 
 	console_printf("%s Entry\n", __FUNCTION__);
 
-	if (dwpal_command_get_ended != (-1))
-	{
-		pid_t pid = getpid();
-		char  socketName[SOCKET_NAME_LENGTH] = "\0";
+	pthread_mutex_lock(&attach_mutex);
 
-		snprintf(socketName, sizeof(socketName) - 1, "%s_%d", COMMAND_ENDED_SOCKET, pid);
-
-		if (close(dwpal_command_get_ended) == (-1))
-		{
-			console_printf("%s; close() fail; dwpal_command_get_ended= %d; errno= %d ('%s')\n", __FUNCTION__, dwpal_command_get_ended, errno, strerror(errno));
-		}
-
-		unlink(socketName);
-		dwpal_command_get_ended = (-1);
-	}
-
-	if (interfaceIndexGet("Driver", "ALL", &idx) == DWPAL_INTERFACE_IS_DOWN)
+	if ((ret = interfaceIndexGet("Driver", "ALL", &idx)) == DWPAL_INTERFACE_IS_DOWN)
 	{
 		console_printf("%s; interfaceIndexGet returned ERROR ==> Abort!\n", __FUNCTION__);
-		return DWPAL_INTERFACE_IS_DOWN;
+		goto end;
 	}
 
 	console_printf("%s; interfaceIndexGet returned idx= %d\n", __FUNCTION__, idx);
-
-	/* dealocate the interface */
-	free((void *)dwpalService[idx]);
-	dwpalService[idx] = NULL;
 
 	/* Cancel the listener thread, if it does exist */
 #if defined EVENT_CALLBACK_THREAD
@@ -1104,12 +1210,22 @@ DWPAL_Ret dwpal_ext_driver_nl_detach(void)
 #endif
 	threadSet(&listenerThreadId, THREAD_CANCEL, NULL);
 
+	/* dealocate the interface (after canceling the listener thread) */
+	if (dwpalService[idx] != NULL)
+	{
+		free((void *)dwpalService[idx]);
+		dwpalService[idx] = NULL;
+	}
+
 	if (dwpal_driver_nl_detach(&context[idx]) == DWPAL_FAILURE)
 	{
 		console_printf("%s; dwpal_driver_nl_detach returned ERROR ==> Abort!\n", __FUNCTION__);
-		return DWPAL_FAILURE;
+		ret = DWPAL_FAILURE;
+		goto end;
 	}
 
+	ret = DWPAL_SUCCESS;
+end:
 	if (isAnyInterfaceActive())
 	{ /* There are still active interfaces */
 		/* Create the listener thread, if it does NOT exist yet */
@@ -1124,7 +1240,7 @@ DWPAL_Ret dwpal_ext_driver_nl_detach(void)
 		pid_t pid = getpid();
 		char  socketName[SOCKET_NAME_LENGTH] = "\0";
 
-		snprintf(socketName, sizeof(socketName) - 1, "%s_%d", EVENT_HANDLER_SOCKET, pid);
+		snprintf_s(socketName, sizeof(socketName), "%s_%d", EVENT_HANDLER_SOCKET, pid);
 
 		if (close(dwpal_event_handler) == (-1))
 		{
@@ -1136,7 +1252,8 @@ DWPAL_Ret dwpal_ext_driver_nl_detach(void)
 	}
 #endif
 
-	return DWPAL_SUCCESS;
+	pthread_mutex_unlock(&attach_mutex);
+	return ret;
 }
 
 
@@ -1147,32 +1264,29 @@ DWPAL_Ret dwpal_ext_driver_nl_detach(void)
  *  \param[in] DwpalExtNlEventCallback nlEventCallback - The callback function to be called while event will be received via this interface
  *  \return DWPAL_Ret (DWPAL_SUCCESS for success, other for failure)
  ***************************************************************************/
-DWPAL_Ret dwpal_ext_driver_nl_attach(DwpalExtNlEventCallback nlEventCallback,DwpalExtNlNonVendorEventCallback nlNonVendorEventCallback)
+DWPAL_Ret dwpal_ext_driver_nl_attach(DwpalExtNlEventCallback nlEventCallback, DwpalExtNlNonVendorEventCallback nlNonVendorEventCallback)
 {
 	int       idx;
 	DWPAL_Ret ret;
 
 	console_printf("%s Entry\n", __FUNCTION__);
 
+	pthread_mutex_lock(&attach_mutex);
+
 	ret = interfaceIndexCreate("Driver", "ALL", &idx);
 	if (ret == DWPAL_FAILURE)
 	{
 		console_printf("%s; interfaceIndexCreate returned ERROR ==> Abort!\n", __FUNCTION__);
-		return DWPAL_FAILURE;
+		goto end;
 	}
 	else if (ret == DWPAL_INTERFACE_ALREADY_UP)
 	{
 		console_printf("%s; Interface (idx= %d) is already up ==> cont...\n", __FUNCTION__, idx);
-		return DWPAL_SUCCESS;
+		ret = DWPAL_SUCCESS;
+		goto end;
 	}
 
 	console_printf("%s; interfaceIndexCreate successfully; returned idx= %d\n", __FUNCTION__, idx);
-
-	if (dwpal_socket_create(&dwpal_command_get_ended /*output*/, COMMAND_ENDED_SOCKET) == DWPAL_FAILURE)
-	{
-		console_printf("%s; dwpal_socket_create returned ERROR ==> Abort!\n", __FUNCTION__);
-		return DWPAL_FAILURE;
-	}
 
 	/* Cancel the listener thread, if it does exist */
 #if defined EVENT_CALLBACK_THREAD
@@ -1183,7 +1297,8 @@ DWPAL_Ret dwpal_ext_driver_nl_attach(DwpalExtNlEventCallback nlEventCallback,Dwp
 	if (dwpal_driver_nl_attach(&context[idx] /*OUT*/) == DWPAL_FAILURE)
 	{
 		console_printf("%s; dwpal_driver_nl_attach returned ERROR ==> Abort!\n", __FUNCTION__);
-		return DWPAL_FAILURE;
+		ret = DWPAL_FAILURE;
+		goto end;
 	}
 
 	/* nlEventCallback can be NULL */
@@ -1192,16 +1307,28 @@ DWPAL_Ret dwpal_ext_driver_nl_attach(DwpalExtNlEventCallback nlEventCallback,Dwp
 	/* Register here the internal static callback function of the 'get command' event */
 	dwpalService[idx]->nlCmdGetCallback = nlCmdGetCallback;
 
-
+	/* Register here the internal static callback function of the 'non-Vendor' event */
 	dwpalService[idx]->nlNonVendorEventCallback = nlNonVendorEventCallback;
 
-	/* Create the listener thread, if it does NOT exist yet */
-#if defined EVENT_CALLBACK_THREAD
-	threadSet(&eventHandlerThreadId, THREAD_CREATE, eventHandlerThreadStart);
-#endif
-	threadSet(&listenerThreadId, THREAD_CREATE, listenerThreadStart);
+	ret = DWPAL_SUCCESS;
+end:
+	if (ret == DWPAL_FAILURE && dwpalService[idx] != NULL)
+	{
+		free((void *)dwpalService[idx]);
+		dwpalService[idx] = NULL;
+	}
 
-	return DWPAL_SUCCESS;
+	/* Create the listener thread, if it does NOT exist yet */
+	if (isAnyInterfaceActive())
+	{
+#if defined EVENT_CALLBACK_THREAD
+		threadSet(&eventHandlerThreadId, THREAD_CREATE, eventHandlerThreadStart);
+#endif
+		threadSet(&listenerThreadId, THREAD_CREATE, listenerThreadStart);
+	}
+
+	pthread_mutex_unlock(&attach_mutex);
+	return ret;
 }
 
 
@@ -1231,30 +1358,46 @@ DWPAL_Ret dwpal_ext_hostap_cmd_send(char *VAPName, char *cmdHeader, FieldsToCmdP
 	if (interfaceIndexGet("hostap", VAPName, &idx) == DWPAL_INTERFACE_IS_DOWN)
 	{
 		console_printf("%s; interfaceIndexGet (VAPName= '%s') returned ERROR ==> Abort!\n", __FUNCTION__, VAPName);
+		*replyLen = 0;
 		return DWPAL_INTERFACE_IS_DOWN;
 	}
 
 	console_printf("%s; interfaceIndexGet returned idx= %d\n", __FUNCTION__, idx);
 
-	if (context[idx] == NULL)
-	{
-		console_printf("%s; context[%d] is NULL ==> Abort!\n", __FUNCTION__, idx);
-		return DWPAL_FAILURE;
-	}
-
+	pthread_mutex_lock(&context_mutex);
 	if (dwpalService[idx]->isConnectionEstablishNeeded == true)
 	{
 		console_printf("%s; interface is being reconnected, but still NOT ready ==> Abort!\n", __FUNCTION__);
+		*replyLen = 0;
+		pthread_mutex_unlock(&context_mutex);
+		return DWPAL_INTERFACE_IS_DOWN;
+	}
+
+	if (context[idx] == NULL)
+	{
+		console_printf("%s; context[%d] is NULL ==> Abort!\n", __FUNCTION__, idx);
+		*replyLen = 0;
+		pthread_mutex_unlock(&context_mutex);
 		return DWPAL_FAILURE;
 	}
 
 	if (dwpal_hostap_cmd_send(context[idx], cmdHeader, fieldsToCmdParse, reply, replyLen) == DWPAL_FAILURE)
 	{
 		console_printf("%s; '%s' command send error\n", __FUNCTION__, cmdHeader);
+		*replyLen = 0;
+		pthread_mutex_unlock(&context_mutex);
 		return DWPAL_FAILURE;
 	}
+	pthread_mutex_unlock(&context_mutex);
 
-	cli_printf("%s; replyLen= %d\nreply=\n%s\n", __FUNCTION__, *replyLen, reply);
+	if (strncmp(cmdHeader, "PING", sizeof("PING")))
+	{
+		cli_printf("%s; replyLen= %d\nreply=\n%s\n", __FUNCTION__, *replyLen, reply);
+	}
+	else
+	{
+		console_printf("%s; replyLen= %d\nreply=\n%s\n", __FUNCTION__, *replyLen, reply);
+	}
 
 	return DWPAL_SUCCESS;
 }
@@ -1269,7 +1412,8 @@ DWPAL_Ret dwpal_ext_hostap_cmd_send(char *VAPName, char *cmdHeader, FieldsToCmdP
  ***************************************************************************/
 DWPAL_Ret dwpal_ext_hostap_interface_detach(char *VAPName)
 {
-	int idx;
+	int  idx;
+	DWPAL_Ret ret;
 
 	if (VAPName == NULL)
 	{
@@ -1279,42 +1423,44 @@ DWPAL_Ret dwpal_ext_hostap_interface_detach(char *VAPName)
 
 	console_printf("%s Entry; VAPName= '%s'\n", __FUNCTION__, VAPName);
 
-	if (interfaceIndexGet("hostap", VAPName, &idx) == DWPAL_INTERFACE_IS_DOWN)
+	pthread_mutex_lock(&attach_mutex);
+
+	if ((ret = interfaceIndexGet("hostap", VAPName, &idx)) == DWPAL_INTERFACE_IS_DOWN)
 	{
 		console_printf("%s; interfaceIndexGet (VAPName= '%s') returned ERROR ==> Abort!\n", __FUNCTION__, VAPName);
-		return DWPAL_INTERFACE_IS_DOWN;
+		goto end;
 	}
 
 	console_printf("%s; interfaceIndexGet returned idx= %d\n", __FUNCTION__, idx);
 
-	/* dealocate the interface */
-	free((void *)dwpalService[idx]);
-	dwpalService[idx] = NULL;
-
-	if (context[idx] == NULL)
-	{
-		console_printf("%s; context[%d] is NULL ==> Abort!\n", __FUNCTION__, idx);
-		return DWPAL_FAILURE;
-	}
-
-	/* Cancel the listener thread, if it does exist */
 #if defined EVENT_CALLBACK_THREAD
 	threadSet(&eventHandlerThreadId, THREAD_CANCEL, NULL);
 #endif
+	/* Cancel the listener thread, if it does exist */
 	threadSet(&listenerThreadId, THREAD_CANCEL, NULL);
 
-	if (dwpal_hostap_interface_detach(&context[idx]) == DWPAL_FAILURE)
+	/* dealocate the interface (after canceling the listener thread) */
+	if (dwpalService[idx] != NULL)
 	{
-		console_printf("%s; dwpal_hostap_interface_detach (VAPName= '%s') returned ERROR ==> Abort!\n", __FUNCTION__, VAPName);
-		return DWPAL_FAILURE;
+		free((void *)dwpalService[idx]);
+		dwpalService[idx] = NULL;
 	}
 
+	if (context[idx] != NULL && dwpal_hostap_interface_detach(&context[idx]) == DWPAL_FAILURE)
+	{
+		console_printf("%s; dwpal_hostap_interface_detach (VAPName= '%s') returned ERROR ==> Abort!\n", __FUNCTION__, VAPName);
+		ret = DWPAL_FAILURE;
+		goto end;
+	}
+
+	ret = DWPAL_SUCCESS;
+end:
 	if (isAnyInterfaceActive())
 	{ /* There are still active interfaces */
-		/* Create the listener thread, if it does NOT exist yet */
 #if defined EVENT_CALLBACK_THREAD
 		threadSet(&eventHandlerThreadId, THREAD_CREATE, eventHandlerThreadStart);
 #endif
+		/* Create the listener thread, if it does exist */
 		threadSet(&listenerThreadId, THREAD_CREATE, listenerThreadStart);
 	}
 #if defined EVENT_CALLBACK_THREAD
@@ -1323,7 +1469,7 @@ DWPAL_Ret dwpal_ext_hostap_interface_detach(char *VAPName)
 		pid_t pid = getpid();
 		char  socketName[SOCKET_NAME_LENGTH] = "\0";
 
-		snprintf(socketName, sizeof(socketName) - 1, "%s_%d", EVENT_HANDLER_SOCKET, pid);
+		snprintf_s(socketName, sizeof(socketName), "%s_%d", EVENT_HANDLER_SOCKET, pid);
 
 		if (close(dwpal_event_handler) == (-1))
 		{
@@ -1335,7 +1481,8 @@ DWPAL_Ret dwpal_ext_hostap_interface_detach(char *VAPName)
 	}
 #endif
 
-	return DWPAL_SUCCESS;
+	pthread_mutex_unlock(&attach_mutex);
+	return ret;
 }
 
 
@@ -1366,16 +1513,19 @@ DWPAL_Ret dwpal_ext_hostap_interface_attach(char *VAPName, DwpalExtHostapEventCa
 
 	console_printf("%s Entry; VAPName= '%s'\n", __FUNCTION__, VAPName);
 
+	pthread_mutex_lock(&attach_mutex);
+
 	ret = interfaceIndexCreate("hostap", VAPName, &idx);
 	if (ret == DWPAL_FAILURE)
 	{
 		console_printf("%s; interfaceIndexCreate (VAPName= '%s') returned ERROR ==> Abort!\n", __FUNCTION__, VAPName);
-		return DWPAL_FAILURE;
+		goto end;
 	}
 	else if (ret == DWPAL_INTERFACE_ALREADY_UP)
 	{
 		console_printf("%s; Interface (idx= %d) is already up ==> cont...\n", __FUNCTION__, idx);
-		return DWPAL_SUCCESS;
+		ret = DWPAL_SUCCESS;
+		goto end;
 	}
 
 	console_printf("%s; interfaceIndexCreate successfully; returned idx= %d\n", __FUNCTION__, idx);
@@ -1386,7 +1536,8 @@ DWPAL_Ret dwpal_ext_hostap_interface_attach(char *VAPName, DwpalExtHostapEventCa
 		if (dwpal_socket_create(&dwpal_event_handler /*output*/, EVENT_HANDLER_SOCKET) == DWPAL_FAILURE)
 		{
 			console_printf("%s; dwpal_socket_create returned ERROR ==> Abort!\n", __FUNCTION__);
-			return DWPAL_FAILURE;
+			ret = DWPAL_FAILURE;
+			goto end;
 		}
 	}
 #endif
@@ -1397,25 +1548,41 @@ DWPAL_Ret dwpal_ext_hostap_interface_attach(char *VAPName, DwpalExtHostapEventCa
 #endif
 	threadSet(&listenerThreadId, THREAD_CANCEL, NULL);
 
-	if (dwpal_hostap_interface_attach(&context[idx] /*OUT*/, VAPName, NULL /*use one-way interface*/) == DWPAL_FAILURE)
+	ret = DWPAL_SUCCESS;
+	if (dwpal_hostap_interface_attach(&context[idx] /*OUT*/, VAPName, NULL /*use one-way interface*/) != DWPAL_SUCCESS)
 	{
 		console_printf("%s; dwpal_hostap_interface_attach (VAPName= '%s') returned ERROR ==> try later on...\n", __FUNCTION__, VAPName);
 
 		/* in this case, continue and try to establish the connection later on */
 		dwpalService[idx]->isConnectionEstablishNeeded = true;
+		ret = DWPAL_INTERFACE_IS_DOWN;
 	}
-	else
+
+	/* Set the callback whether attach succeeded or not */
+	dwpalService[idx]->hostapEventCallback = hostapEventCallback;
+
+	if (ret == DWPAL_SUCCESS)
 	{
 		dwpalService[idx]->isConnectionEstablishNeeded = false;
 	}
 
-	dwpalService[idx]->hostapEventCallback = hostapEventCallback;
+
+end:
+	if (ret == DWPAL_FAILURE && dwpalService[idx] != NULL)
+	{
+		free((void *)dwpalService[idx]);
+		dwpalService[idx] = NULL;
+	}
 
 	/* Create the listener thread, if it does NOT exist yet */
+	if (isAnyInterfaceActive())
+	{
 #if defined EVENT_CALLBACK_THREAD
-	threadSet(&eventHandlerThreadId, THREAD_CREATE, eventHandlerThreadStart);
+		threadSet(&eventHandlerThreadId, THREAD_CREATE, eventHandlerThreadStart);
 #endif
-	threadSet(&listenerThreadId, THREAD_CREATE, listenerThreadStart);
+		threadSet(&listenerThreadId, THREAD_CREATE, listenerThreadStart);
+	}
 
-	return DWPAL_SUCCESS;
+	pthread_mutex_unlock(&attach_mutex);
+	return ret;
 }

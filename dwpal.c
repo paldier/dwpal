@@ -21,6 +21,7 @@
 #include <slibc/string.h>
 #else
 #include "safe_str_lib.h"
+#define snprintf_s snprintf
 #endif
 
 #include "dwpal.h"
@@ -98,7 +99,7 @@ static int error_handler(struct sockaddr_nl *nla, struct nlmsgerr *err,
 			 void *arg)
 {
 	(void)nla;
-	printf(" ERROR: %s\n", strerror(-(err->error)));
+	console_printf(" ERROR: %s\n", strerror(-(err->error)));
 	*(int *)arg = err->error;
 	return NL_STOP;
 }
@@ -796,7 +797,7 @@ static bool arrayValuesGet(char *stringOfValues, size_t totalSizeOfArg, ParamPar
 }
 
 
-static bool fieldValuesGet(char *buf, size_t bufLen, const char *stringToSearch, char *endFieldName[], char *stringOfValues /*OUT*/)
+static bool fieldValuesGet(char *buf, size_t bufLen, ParamParsingType parsingType, const char *stringToSearch, char *endFieldName[], char *stringOfValues /*OUT*/)
 {
 	/* handles list of fields, one by one in the same row, for example: "... btm_supported=1 ..." or
 	   "... SupportedRates=2 4 11 22 12 18 24 36 48 72 96 108 ..." */
@@ -806,18 +807,35 @@ static bool fieldValuesGet(char *buf, size_t bufLen, const char *stringToSearch,
 	char    *localStringToSearch = NULL;
 	int     i, idx=0, numOfCharacters = 0, numOfCharactersToCopy = 0;
 	bool    isFirstEndOfString = true, ret = false;
-	char    tempStringOfValues[HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH], localEndFieldName[HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH];
+	char    *tempStringOfValues=NULL, *localEndFieldName=NULL;
 
-	localBuf = (char *)malloc(bufLen + 2 /* '\0' & 'blank' */);
-	if (localBuf == NULL)
+	tempStringOfValues = (char *)malloc(HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);
+	if (tempStringOfValues == NULL)
 	{
 		console_printf("%s; malloc failed ==> Abort!\n", __FUNCTION__);
 		return false;
 	}
 
+	localEndFieldName = (char *)malloc(HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);
+	if (localEndFieldName == NULL)
+	{
+		free((void *)tempStringOfValues);
+		console_printf("%s; malloc failed ==> Abort!\n", __FUNCTION__);
+		return false;
+	}
+
+	localBuf = (char *)malloc(bufLen + 2 /* '\0' & 'blank' */);
+	if (localBuf == NULL)
+	{
+		console_printf("%s; malloc failed ==> Abort!\n", __FUNCTION__);
+		free((void *)tempStringOfValues);
+		free((void *)localEndFieldName);
+		return false;
+	}
+
 	/* Add ' ' at the beginning of a string - to handle a case in which the buf starts with the
 	   value of stringToSearch, like buf= 'candidate=d8:fe:e3:3e:bd:14,2178,83,5,7,255 candidate=...' */
-	snprintf(localBuf, bufLen + 2, " %s", buf);
+	snprintf_s(localBuf, bufLen + 2, " %s", buf);
 
 	/* localStringToSearch set to stringToSearch with addition of " " at the beginning -
 	   it is a MUST in order to differentiate between "ssid" and "bssid" */
@@ -826,10 +844,12 @@ static bool fieldValuesGet(char *buf, size_t bufLen, const char *stringToSearch,
 	{
 		console_printf("%s; localStringToSearch is NULL ==> Abort!\n", __FUNCTION__);
 		free((void *)localBuf);
+		free((void *)tempStringOfValues);
+		free((void *)localEndFieldName);
 		return false;
 	}
 
-	snprintf(localStringToSearch, DWPAL_FIELD_NAME_LENGTH, " %s", stringToSearch);
+	snprintf_s(localStringToSearch, DWPAL_FIELD_NAME_LENGTH, " %s", stringToSearch);
 
 	restOfStringStart = localBuf;
 
@@ -846,7 +866,7 @@ static bool fieldValuesGet(char *buf, size_t bufLen, const char *stringToSearch,
 		i = 0;
 		while (strncmp(endFieldName[i], "\n", 1))
 		{  /* run over all field names in the string */
-			snprintf(localEndFieldName, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH, " %s", endFieldName[i]);  /* in order to differentiate between VHT_MCS and HT_MCS */
+			snprintf_s(localEndFieldName, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH, " %s", endFieldName[i]);  /* in order to differentiate between VHT_MCS and HT_MCS */
 			stringEnd = strstr(restOfStringStart, localEndFieldName);
 			if (stringEnd != NULL)
 			{
@@ -889,23 +909,41 @@ static bool fieldValuesGet(char *buf, size_t bufLen, const char *stringToSearch,
 			console_printf("%s; numOfCharacters= %d ==> Abort!\n", __FUNCTION__, numOfCharacters);
 			free((void *)localBuf);
 			free((void *)localStringToSearch);
+			free((void *)tempStringOfValues);
+			free((void *)localEndFieldName);
 			return false;
 		}
 
 		/* Copy the characters of the value, and set the last one to '\0' */
-		strncpy_s(tempStringOfValues, sizeof(tempStringOfValues), restOfStringStart, numOfCharacters);
+		strncpy_s(tempStringOfValues, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH, restOfStringStart, numOfCharacters);
+		if (numOfCharacters >= (int)HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH)
+		{
+			console_printf("%s; numOfCharacters (%d) >= HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH (%d) ==> Abort!\n", __FUNCTION__, numOfCharacters, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);
+			free((void *)localBuf);
+			free((void *)localStringToSearch);
+			free((void *)tempStringOfValues);
+			free((void *)localEndFieldName);
+			return false;
+		}
 		tempStringOfValues[numOfCharacters - 1] = '\0';
 		//console_printf("%s; stringToSearch= '%s'; tempStringOfValues= '%s'\n", __FUNCTION__, stringToSearch, tempStringOfValues);
 
-		/* Check if all elements are valid; if an element contains "=", it is NOT valid ==> do NOT copy it! */
+		/* Check if all elements are valid; if an element of an array contains "=", it is NOT valid ==> do NOT copy it! */
 		for (i=0; i < numOfCharacters; i++)
 		{
-			if ( (tempStringOfValues[i] == ' ') || (tempStringOfValues[i] == '\0') )
+			if ( (parsingType == DWPAL_STR_ARRAY_PARAM) ||
+			     (parsingType == DWPAL_INT_ARRAY_PARAM) ||
+				 (parsingType == DWPAL_INT_HEX_ARRAY_PARAM) )
+			{
+				if ( (tempStringOfValues[i] == '=') || (tempStringOfValues[i] == '\0') )
+				{
+					numOfCharactersToCopy = i + 1 /* convert index to number-of */;
+					break;  /* Only in case of array of values, do NOT allow "=" character */
+				}
+			}
+			else if ( (tempStringOfValues[i] == ' ') || (tempStringOfValues[i] == '\0') )
 			{
 				numOfCharactersToCopy = i + 1 /* convert index to number-of */;
-			}
-			else if (tempStringOfValues[i] == '=')
-			{
 				break;
 			}
 		}
@@ -936,6 +974,8 @@ static bool fieldValuesGet(char *buf, size_t bufLen, const char *stringToSearch,
 
 	free((void *)localBuf);
 	free((void *)localStringToSearch);
+	free((void *)tempStringOfValues);
+	free((void *)localEndFieldName);
 
 	//console_printf("%s; ret= %d, stringToSearch= '%s'; stringOfValues= '%s'\n", __FUNCTION__, ret, stringToSearch, stringOfValues);
 
@@ -993,7 +1033,7 @@ static bool columnOfParamsToRowConvert(char *msg, size_t msgLen, char *endFieldN
 		return false;
 	}
 
-	lineMsg = strtok_s(localMsg, (rsize_t *)&dmaxLen, "\n", &p2str);
+	lineMsg = strtok_s(localMsg, &dmaxLen, "\n", &p2str);
 
 	while (lineMsg != NULL)
 	{
@@ -1005,7 +1045,7 @@ static bool columnOfParamsToRowConvert(char *msg, size_t msgLen, char *endFieldN
 			break;
 		}
 
-		lineMsg = strtok_s(NULL, (rsize_t *)&dmaxLen, "\n", &p2str);
+		lineMsg = strtok_s(NULL, &dmaxLen, "\n", &p2str);
 	}
 
 	free ((void *)localMsg);
@@ -1035,7 +1075,7 @@ DWPAL_Ret dwpal_proc_file_copy(void *buffer, uint *ret, uint max_size, char * fi
 {
 	FILE *ptr_myfile;
 	char full_path[MAX_FILE_NAME];
-	int res = snprintf(full_path, sizeof(full_path), "/proc/net/mtlk/%s", filename);
+	int res = snprintf_s(full_path, sizeof(full_path), "/proc/net/mtlk/%s", filename);
 	if (res < 0 || res >= (int)sizeof(full_path))
 		return DWPAL_FAILURE;
 
@@ -1279,6 +1319,7 @@ DWPAL_Ret dwpal_driver_nl_msg_get(void *context, DWPAL_NlEventType nlEventType, 
 
 		/* will trigger nlEventCallback() function call */
 		res = nl_recvmsgs(localContext->interface.driver.nlSocketEvent, cb);
+		nl_cb_put(cb);
 	}
 	else if (nlEventType == DWPAL_NL_SOLICITED_EVENT)
 	{
@@ -1289,10 +1330,12 @@ DWPAL_Ret dwpal_driver_nl_msg_get(void *context, DWPAL_NlEventType nlEventType, 
 
 		/* will trigger nlEventCallback() function call */
 		res = nl_recvmsgs(localContext->interface.driver.nlSocketCmdGet, cb);
+		nl_cb_put(cb);
 	}
 	else
 	{
 		console_printf("%s; invalid nlEventType (%d) ==> Abort!\n", __FUNCTION__, nlEventType);
+		nl_cb_put(cb);
 		return DWPAL_FAILURE;
 	}
 
@@ -1484,21 +1527,30 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 	DWPAL_Ret ret = DWPAL_SUCCESS;
 	int       i = 0, idx = 0, numOfNameArrayArgs = 0, lineIdx = 0;
 	bool      isEndFieldNameAllocated = false, isMissingParam = false;
-	char      stringOfValues[HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH];
+	char      *stringOfValues = NULL;
 	char      *lineMsg, *localMsg, *p2str = NULL, *p2strMandatory = NULL;
 	rsize_t   dmaxLen, dmaxLenMandatory;
 	size_t    sizeOfStruct = 0, msgStringLen;
 	char      **endFieldName = NULL;
 
+	stringOfValues = (char *)malloc(HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);
+	if (stringOfValues == NULL)
+	{
+		console_printf("%s; malloc failed ==> Abort!\n", __FUNCTION__);
+		return DWPAL_FAILURE;
+	}
+
 	if ( (msg == NULL) || (msgLen == 0) || (fieldsToParse == NULL) )
 	{
 		console_printf("%s; input params error ==> Abort!\n", __FUNCTION__);
+		free((void *)stringOfValues);
 		return DWPAL_FAILURE;
 	}
 
 	if ( (msgStringLen = strnlen_s(msg, HOSTAPD_TO_DWPAL_MSG_LENGTH)) > msgLen )
 	{
 		console_printf("%s; msgStringLen (%d) is bigger than msgLen (%d) ==> Abort!\n", __FUNCTION__, msgStringLen, msgLen);
+		free((void *)stringOfValues);
 		return DWPAL_FAILURE;
 	}
 
@@ -1528,6 +1580,7 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					if ( (fieldsToParse[i].field != NULL) && (fieldsToParse[i].totalSizeOfArg == 0) )
 					{
 						console_printf("%s; Error; DWPAL_STR_PARAM must have positive value for totalSizeOfArg ==> Abort!\n", __FUNCTION__);
+						free((void *)stringOfValues);
 						return DWPAL_FAILURE;
 					}
 
@@ -1539,6 +1592,7 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					if ( (fieldsToParse[i].field != NULL) && (fieldsToParse[i].totalSizeOfArg == 0) )
 					{
 						console_printf("%s; Error; DWPAL_STR_ARRAY_PARAM must have positive value for totalSizeOfArg ==> Abort!\n", __FUNCTION__);
+						free((void *)stringOfValues);
 						return DWPAL_FAILURE;
 					}
 
@@ -1587,6 +1641,7 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					if ( (fieldsToParse[i].field != NULL) && (fieldsToParse[i].totalSizeOfArg == 0) )
 					{
 						console_printf("%s; Error; DWPAL_INT_ARRAY_PARAM/DWPAL_INT_HEX_ARRAY_PARAM must have positive value for totalSizeOfArg ==> Abort!\n", __FUNCTION__);
+						free((void *)stringOfValues);
 						return DWPAL_FAILURE;
 					}
 
@@ -1764,8 +1819,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 						}
 						else
 						{
-							memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-							if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+							memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+							if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 							{
 								if (fieldsToParse[i].numOfValidArgs != NULL)
 								{
@@ -1808,8 +1863,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (arrayValuesGet(stringOfValues, fieldsToParse[i].totalSizeOfArg, DWPAL_STR_ARRAY_PARAM, fieldsToParse[i].numOfValidArgs, (char *)field) == false)
 							{
@@ -1842,8 +1897,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (strncmp(stringOfValues, "UNKNOWN", 8))
 							{
@@ -1886,8 +1941,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (strncmp(stringOfValues, "UNKNOWN", 8))
 							{
@@ -1930,8 +1985,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (strncmp(stringOfValues, "UNKNOWN", 8))
 							{
@@ -1974,8 +2029,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (strncmp(stringOfValues, "UNKNOWN", 8))
 							{
@@ -2018,8 +2073,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (strncmp(stringOfValues, "UNKNOWN", 8))
 							{
@@ -2062,8 +2117,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (strncmp(stringOfValues, "UNKNOWN", 8))
 							{
@@ -2106,8 +2161,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (strncmp(stringOfValues, "UNKNOWN", 8))
 							{
@@ -2150,8 +2205,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							//console_printf("%s; [1] fieldsToParse[%d].numOfValidArgs= %d, stringOfValues= '%s'\n", __FUNCTION__, i, *(fieldsToParse[i].numOfValidArgs), stringOfValues);
 							if (arrayValuesGet(stringOfValues, fieldsToParse[i].totalSizeOfArg, DWPAL_INT_ARRAY_PARAM, fieldsToParse[i].numOfValidArgs, field) == false)
@@ -2181,8 +2236,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (fieldsToParse[i].numOfValidArgs != NULL)
 							{
@@ -2212,8 +2267,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (arrayValuesGet(stringOfValues, fieldsToParse[i].totalSizeOfArg, DWPAL_INT_HEX_ARRAY_PARAM, fieldsToParse[i].numOfValidArgs, field) == false)
 							{
@@ -2242,8 +2297,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 					}
 					else
 					{
-						memset(stringOfValues, 0, sizeof(stringOfValues));  /* reset the string value array */
-						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
+						memset(stringOfValues, 0, HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH);  /* reset the string value array */
+						if (fieldValuesGet(lineMsg, msgLen, fieldsToParse[i].parsingType, fieldsToParse[i].stringToSearch, endFieldName, stringOfValues) == true)
 						{
 							if (fieldsToParse[i].numOfValidArgs != NULL)
 							{
@@ -2290,6 +2345,8 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
 		free((void *)endFieldName);
 	}
 
+	free((void *)stringOfValues);
+
 	if (ret != DWPAL_FAILURE)
 	{
 		if (isMissingParam)
@@ -2315,25 +2372,27 @@ DWPAL_Ret dwpal_string_to_struct_parse(char *msg, size_t msgLen, FieldsToParse f
  ***************************************************************************/
 DWPAL_Ret dwpal_hostap_cmd_send(void *context, const char *cmdHeader, FieldsToCmdParse *fieldsToCmdParse, char *reply /*OUT*/, size_t *replyLen /*IN/OUT*/)
 {
-	int       i;
-	DWPAL_Ret ret = DWPAL_SUCCESS;
-	char      cmd[DWPAL_TO_HOSTAPD_MSG_LENGTH];
+	int  i;
+	int  ret;
+	char cmd[DWPAL_TO_HOSTAPD_MSG_LENGTH];
+	DWPAL_Context *localContext = (DWPAL_Context *)context;
 
-	if ( (context == NULL) || (cmdHeader == NULL) || (reply == NULL) || (replyLen == NULL) )
+	if ( (localContext == NULL) || (cmdHeader == NULL) || (reply == NULL) || (replyLen == NULL) )
 	{
 		console_printf("%s; input params error ==> Abort!\n", __FUNCTION__);
 		return DWPAL_FAILURE;
 	}
 
-	if ( ((DWPAL_Context *)context)->interface.hostapd.wpaCtrlPtr == NULL )
+	if (localContext->interface.hostapd.wpaCtrlPtr == NULL)
 	{
 		console_printf("%s; input params error (wpaCtrlPtr = NULL) ==> Abort!\n", __FUNCTION__);
+		*replyLen = 0;
 		return DWPAL_FAILURE;
 	}
 
-	//console_printf("%s Entry; VAPName= '%s', cmdHeader= '%s', replyLen= %d\n", __FUNCTION__, ((DWPAL_Context *)context)->interface.hostapd.VAPName, cmdHeader, *replyLen);
+	//console_printf("%s Entry; VAPName= '%s', cmdHeader= '%s', replyLen= %d\n", __FUNCTION__, localContext->interface.hostapd.VAPName, cmdHeader, *replyLen);
 
-	snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s", cmdHeader);
+	snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s", cmdHeader);
 
 	if (fieldsToCmdParse != NULL)
 	{
@@ -2348,11 +2407,11 @@ DWPAL_Ret dwpal_hostap_cmd_send(void *context, const char *cmdHeader, FieldsToCm
 						//console_printf("%s; fieldsToCmdParse[%d].field= '%s'\n", __FUNCTION__, i, (char *)fieldsToCmdParse[i].field);
 						if (fieldsToCmdParse[i].preParamString == NULL)
 						{
-							snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s", cmd, (char *)fieldsToCmdParse[i].field);
+							snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s", cmd, (char *)fieldsToCmdParse[i].field);
 						}
 						else
 						{
-							snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s%s", cmd, fieldsToCmdParse[i].preParamString, (char *)fieldsToCmdParse[i].field);
+							snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s%s", cmd, fieldsToCmdParse[i].preParamString, (char *)fieldsToCmdParse[i].field);
 						}
 						break;
 
@@ -2363,11 +2422,11 @@ DWPAL_Ret dwpal_hostap_cmd_send(void *context, const char *cmdHeader, FieldsToCm
 						//console_printf("%s; fieldsToCmdParse[%d].field= %d\n", __FUNCTION__, i, *((int *)fieldsToCmdParse[i].field));
 						if (fieldsToCmdParse[i].preParamString == NULL)
 						{
-							snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %d", cmd, *((int *)fieldsToCmdParse[i].field));
+							snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %d", cmd, *((int *)fieldsToCmdParse[i].field));
 						}
 						else
 						{
-							snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s%d", cmd, fieldsToCmdParse[i].preParamString, *((int *)fieldsToCmdParse[i].field));
+							snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s%d", cmd, fieldsToCmdParse[i].preParamString, *((int *)fieldsToCmdParse[i].field));
 						}
 						break;
 
@@ -2375,11 +2434,11 @@ DWPAL_Ret dwpal_hostap_cmd_send(void *context, const char *cmdHeader, FieldsToCm
 						//console_printf("%s; fieldsToCmdParse[%d].field= %u\n", __FUNCTION__, i, *((unsigned int *)fieldsToCmdParse[i].field));
 						if (fieldsToCmdParse[i].preParamString == NULL)
 						{
-							snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %u", cmd, *((unsigned int *)fieldsToCmdParse[i].field));
+							snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %u", cmd, *((unsigned int *)fieldsToCmdParse[i].field));
 						}
 						else
 						{
-							snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s%u", cmd, fieldsToCmdParse[i].preParamString, *((unsigned int *)fieldsToCmdParse[i].field));
+							snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s%u", cmd, fieldsToCmdParse[i].preParamString, *((unsigned int *)fieldsToCmdParse[i].field));
 						}
 						break;
 
@@ -2397,7 +2456,8 @@ DWPAL_Ret dwpal_hostap_cmd_send(void *context, const char *cmdHeader, FieldsToCm
 
 					default:
 						console_printf("%s; (parsingType= %d) ERROR ==> Abort!\n", __FUNCTION__, fieldsToCmdParse[i].parsingType);
-						ret = DWPAL_FAILURE;
+						*replyLen = 0;
+						return DWPAL_FAILURE;
 						break;
 				}
 			}
@@ -2410,22 +2470,59 @@ DWPAL_Ret dwpal_hostap_cmd_send(void *context, const char *cmdHeader, FieldsToCm
 
 	memset((void *)reply, '\0', *replyLen);  /* Clear the output buffer */
 
-	ret = wpa_ctrl_request(((DWPAL_Context *)context)->interface.hostapd.wpaCtrlPtr,
+	if (localContext->interface.hostapd.wpaCtrlEventCallback == NULL)
+	{
+		/* non-valid wpaCtrlEventCallback states that this is a one-way connection */
+		while (wpa_ctrl_pending(localContext->interface.hostapd.wpaCtrlPtr))
+		{
+			/* clear this message still stuck in the socket, probably becuase hostapd
+			 * took too long to answer a previous request made by us.
+			 * if not cleared, this message will be the response for this wpa_ctrl_request call */
+			size_t buffLen = HOSTAPD_TO_DWPAL_MSG_LENGTH * sizeof(char);
+			char *buff = (char *)malloc((size_t)buffLen);
+
+			console_printf("%s; socket has pending messages\n", __FUNCTION__);
+
+			if (buff == NULL)
+			{
+				console_printf("%s; malloc Failed ==> Abort!\n", __FUNCTION__);
+				return DWPAL_FAILURE;
+			}
+
+			memset((void *)buff, '\0', buffLen);
+			buffLen -= 1 * sizeof(char);
+			ret = wpa_ctrl_recv(localContext->interface.hostapd.wpaCtrlPtr,
+					    buff, &buffLen);
+			free((void *)buff);
+			if (ret < 0)
+			{
+				console_printf("%s; wpa_ctrl_recv() returned ERROR ==> Abort!\n", __FUNCTION__);
+				return DWPAL_FAILURE;
+			}
+		}
+	}
+
+	ret = wpa_ctrl_request(localContext->interface.hostapd.wpaCtrlPtr,
 	                       cmd,
 						   strnlen_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH),
 						   reply,
 						   replyLen /* should be msg-len in/out param */,
-						   ((DWPAL_Context *)context)->interface.hostapd.wpaCtrlEventCallback);
+						   localContext->interface.hostapd.wpaCtrlEventCallback);
 	if (ret < 0)
 	{
-		console_printf("%s; wpa_ctrl_request() returned error; VAPName= '%s' (ret= %d) ==> Abort!\n", __FUNCTION__, ((DWPAL_Context *)context)->interface.hostapd.VAPName, ret);
+		console_printf("%s; wpa_ctrl_request() returned error; VAPName= '%s' (ret= %d) ==> Abort!\n", __FUNCTION__, localContext->interface.hostapd.VAPName, ret);
+		*replyLen = 0;
 		return DWPAL_FAILURE;
 	}
 	reply[*replyLen] = '\0';  /* we need it to clear the "junk" at the end of the string */
 
+	if (reply[0] == '\0')
+	{  /* The 'reply' string is empty */
+		*replyLen = 0;
+	}
 	//console_printf("%s; replyLen= %d\nreply=\n%s\n", __FUNCTION__, *replyLen, reply);
 
-	return ret;
+	return DWPAL_SUCCESS;
 }
 
 
@@ -2774,7 +2871,7 @@ DWPAL_Ret dwpal_hostap_interface_attach(void **context /*OUT*/, const char *VAPN
 	localContext->interface.hostapd.wpaCtrlEventCallback = wpaCtrlEventCallback;
 
 	/* check if '/var/run/hostapd/wlanX' or '/var/run/wpa_supplicant/wlanX' exists, and update context's database */
-	snprintf(wpaCtrlName, DWPAL_WPA_CTRL_STRING_LENGTH, "%s%s", "/var/run/hostapd/", localContext->interface.hostapd.VAPName);
+	snprintf_s(wpaCtrlName, DWPAL_WPA_CTRL_STRING_LENGTH, "%s%s", "/var/run/hostapd/", localContext->interface.hostapd.VAPName);
 	if (access(wpaCtrlName, F_OK) == 0)
 	{
 		//console_printf("%s; Radio '%s' exists - AP Mode\n", __FUNCTION__, localContext->interface.hostapd.VAPName);
@@ -2783,7 +2880,7 @@ DWPAL_Ret dwpal_hostap_interface_attach(void **context /*OUT*/, const char *VAPN
 	}
 	else
 	{
-		snprintf(wpaCtrlName, DWPAL_WPA_CTRL_STRING_LENGTH, "%s%s", "/var/run/wpa_supplicant/", localContext->interface.hostapd.VAPName);
+		snprintf_s(wpaCtrlName, DWPAL_WPA_CTRL_STRING_LENGTH, "%s%s", "/var/run/wpa_supplicant/", localContext->interface.hostapd.VAPName);
 		if (access(wpaCtrlName, F_OK) == 0)
 		{
 			//console_printf("%s; Radio '%s' exists - STA Mode\n", __FUNCTION__, localContext->interface.hostapd.VAPName);

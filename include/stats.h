@@ -202,8 +202,8 @@ stats peer_capability[] = {
 {PEER_CAPABILITY,	"Explicit beam forming supported",	FLAG,		0},
 {PEER_CAPABILITY,	"40MHz intolerant",			FLAG,		0},
 {VENDOR_ENUM,		"Vendor",				NONE,		0},
-{PEER_CAPABILITY,	"Max TX spatial streams",		LONG,		0},
-{PEER_CAPABILITY,	"Max RX spatial streams",		LONG,		0},
+{PEER_CAPABILITY,	"Tx STBC support",	        	LONG,		0},
+{PEER_CAPABILITY,	"Rx STBC support",      		LONG,		0},
 {PEER_CAPABILITY,	"Maximum A-MPDU Length Exponent",	LONG,		0},
 {PEER_CAPABILITY,	"Minimum MPDU Start Spacing",		LONG,		0},
 {PEER_CAPABILITY,	"Timestamp of station association",	TIMESTAMP,	0}

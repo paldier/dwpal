@@ -31,7 +31,7 @@
 #define DWPAL_OPCODE_STRING_LENGTH             64
 #define DRIVER_NL_TO_DWPAL_MSG_LENGTH          8192
 #define DWPAL_FIELD_NAME_LENGTH                128
-#define HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH   1024
+#define HOSTAPD_TO_DWPAL_VALUE_STRING_LENGTH   2048
 #define SOCKET_NAME_LENGTH                     100
 #define NUM_OF_FREQUENCIES                     32
 #define SCAN_PARAM_STRING_LENGTH               64

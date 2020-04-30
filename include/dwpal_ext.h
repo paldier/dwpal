@@ -13,8 +13,6 @@
 
 #define NUM_OF_SUPPORTED_VAPS 32
 
-#define COMMAND_ENDED_SOCKET "/tmp/dwpal_command_get_ended_socket"
-
 #define cli_printf(...)       \
 {                             \
 	if (isCliPrintf)          \

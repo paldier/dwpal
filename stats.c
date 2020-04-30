@@ -386,12 +386,16 @@ int check_stats_cmd(int num_arg, char *cmd[])
 				 Vendordata, VendorDataLen, &outLen, outData) != DWPAL_SUCCESS)
 			{
 				PRINT_ERROR("%s; dwpal_ext_driver_nl_get returned ERROR ==> Abort!\n", __FUNCTION__);
+				dwpal_ext_driver_nl_detach();
 				return -1;
 			}
 			if ( outLen )
 				goutData = &outData[NL_ATTR_HDR];
 			else
+			{
+				dwpal_ext_driver_nl_detach();
 				return -1;
+			}
 
 			if ( gCmd[i].c != PEER_LIST )
 				help_print( gCmd[i].c, true );
@@ -400,6 +404,8 @@ int check_stats_cmd(int num_arg, char *cmd[])
 			break;
 		}
 	}
+
+	dwpal_ext_driver_nl_detach();
 	goutData = NULL;
 	return 0;
 }

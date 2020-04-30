@@ -24,6 +24,7 @@
 #include <slibc/string.h>
 #else
 #include "safe_str_lib.h"
+#define snprintf_s snprintf
 #endif
 
 #include "dwpal.h"
@@ -316,7 +317,7 @@ DWPAL_Ret nlCliOneShotCalFileReadyCallback(char *ifname, size_t len, unsigned ch
 		if (fullScriptName[0] != '\0')
 		{
 			char command[DWPAL_FIELD_NAME_LENGTH] = "\0";
-			snprintf(command, DWPAL_FIELD_NAME_LENGTH, "%s %s cal_%s.bin", fullScriptName, fname_template, ifname);
+			snprintf_s(command, DWPAL_FIELD_NAME_LENGTH, "%s %s cal_%s.bin", fullScriptName, fname_template, ifname);
 			console_printf("%s; Executing command: %s\n", __FUNCTION__, command);
 			if (0 != system(command))
 			{
@@ -638,7 +639,7 @@ static bool resultsPrint(FieldsToParse fieldsToParse[], size_t totalSizeOfArg, s
 
 		if (totalSizeOfArg > 1)
 		{
-			snprintf(indexToPrint, sizeof(indexToPrint), "[%d] ", k);
+			snprintf_s(indexToPrint, sizeof(indexToPrint), "[%d] ", k);
 			//console_printf("%s; sizeof(indexToPrint)= %d, indexToPrint= '%s'\n", __FUNCTION__, sizeof(indexToPrint), indexToPrint);
 		}
 
@@ -839,10 +840,10 @@ static DWPAL_Ret dwpal_req_beacon_handle(void *localContext, char *VAPName, char
 	}
 	memset((void *)reply, '\0', HOSTAPD_TO_DWPAL_MSG_LENGTH);  /* Clear the output buffer */
 
-	snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "REQ_BEACON");
+	snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "REQ_BEACON");
 	for (i=0; i < 9; i++)
 	{
-		snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s", cmd, fields[i]);
+		snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s", cmd, fields[i]);
 	}
 
 	console_printf("%s; cmd= '%s'\n", __FUNCTION__, cmd);
@@ -911,7 +912,7 @@ static DWPAL_Ret dwpal_get_sta_measurements_handle(void *localContext, char *VAP
 	}
 	memset((void *)reply, '\0', HOSTAPD_TO_DWPAL_MSG_LENGTH);  /* Clear the output buffer */
 
-	snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "STA_MEASUREMENTS %s %s", VAPName, MACAddress);
+	snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "STA_MEASUREMENTS %s %s", VAPName, MACAddress);
 
 	if (isDwpalExtenderMode)
 	{
@@ -1002,7 +1003,7 @@ static DWPAL_Ret dwpal_get_vap_measurements_handle(void *localContext, char *VAP
 	}
 	memset((void *)reply, '\0', HOSTAPD_TO_DWPAL_MSG_LENGTH);  /* Clear the output buffer */
 
-	snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "GET_VAP_MEASUREMENTS %s", VAPName);
+	snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "GET_VAP_MEASUREMENTS %s", VAPName);
 	console_printf("%s; cmd= '%s'\n", __FUNCTION__, cmd);
 
 	if (isDwpalExtenderMode)
@@ -1424,20 +1425,20 @@ static DWPAL_Ret dwpal_rrm_beacon_rep_received_event_parse(char *msg, size_t msg
 
 	DWPAL_rrm_beacon_rep_received_event rrm_beacon_rep_received_event;
 	DWPAL_Ret                           ret;
-	size_t                              numOfValidArgs[5];
+	size_t                              numOfValidArgs[11];
 	FieldsToParse                       fieldsToParse[] =
 	{
 		{ NULL /*opCode*/,                                             &numOfValidArgs[0],  DWPAL_STR_PARAM,     NULL,                    0                                                },
 		{ NULL /*VAPName*/,                                            &numOfValidArgs[1],  DWPAL_STR_PARAM,     NULL,                    0                                                },
 		{ (void *)&rrm_beacon_rep_received_event.MACAddress,           &numOfValidArgs[2],  DWPAL_STR_PARAM,     NULL,                    sizeof(rrm_beacon_rep_received_event.MACAddress) },
-		{ (void *)&rrm_beacon_rep_received_event.channel,              &numOfValidArgs[4],  DWPAL_INT_PARAM,     "channel=",              0                                                },
-		{ (void *)&rrm_beacon_rep_received_event.dialog_token,         &numOfValidArgs[5],  DWPAL_INT_PARAM,     "dialog_token=",         0                                                },
-		{ (void *)&rrm_beacon_rep_received_event.measurement_rep_mode, &numOfValidArgs[6],  DWPAL_INT_PARAM,     "measurement_rep_mode=", 0                                                },
-		{ (void *)&rrm_beacon_rep_received_event.op_class,             &numOfValidArgs[7],  DWPAL_INT_PARAM,     "op_class=",             0                                                },
-		{ (void *)&rrm_beacon_rep_received_event.duration,             &numOfValidArgs[8],  DWPAL_INT_PARAM,     "duration=",             0                                                },
-		{ (void *)&rrm_beacon_rep_received_event.rcpi,                 &numOfValidArgs[9],  DWPAL_INT_HEX_PARAM, "rcpi=",                 0                                                },
-		{ (void *)&rrm_beacon_rep_received_event.rsni,                 &numOfValidArgs[10], DWPAL_INT_HEX_PARAM, "rsni=",                 0                                                },
-		{ (void *)&rrm_beacon_rep_received_event.bssid,                &numOfValidArgs[11], DWPAL_STR_PARAM,     "bssid=",                sizeof(rrm_beacon_rep_received_event.bssid)      },
+		{ (void *)&rrm_beacon_rep_received_event.channel,              &numOfValidArgs[3],  DWPAL_INT_PARAM,     "channel=",              0                                                },
+		{ (void *)&rrm_beacon_rep_received_event.dialog_token,         &numOfValidArgs[4],  DWPAL_INT_PARAM,     "dialog_token=",         0                                                },
+		{ (void *)&rrm_beacon_rep_received_event.measurement_rep_mode, &numOfValidArgs[5],  DWPAL_INT_PARAM,     "measurement_rep_mode=", 0                                                },
+		{ (void *)&rrm_beacon_rep_received_event.op_class,             &numOfValidArgs[6],  DWPAL_INT_PARAM,     "op_class=",             0                                                },
+		{ (void *)&rrm_beacon_rep_received_event.duration,             &numOfValidArgs[7],  DWPAL_INT_PARAM,     "duration=",             0                                                },
+		{ (void *)&rrm_beacon_rep_received_event.rcpi,                 &numOfValidArgs[8],  DWPAL_INT_HEX_PARAM, "rcpi=",                 0                                                },
+		{ (void *)&rrm_beacon_rep_received_event.rsni,                 &numOfValidArgs[9], DWPAL_INT_HEX_PARAM,  "rsni=",                 0                                                },
+		{ (void *)&rrm_beacon_rep_received_event.bssid,                &numOfValidArgs[10], DWPAL_STR_PARAM,     "bssid=",                sizeof(rrm_beacon_rep_received_event.bssid)      },
 
 		/* Must be at the end */
 		{ NULL, NULL, DWPAL_NUM_OF_PARSING_TYPES, NULL, 0 }
@@ -1923,7 +1924,15 @@ static int dwpalOneShotEventCallback(char *radioName, char *opCode, char *msg, s
 			if (msg != NULL)
 			{
 				/* Handle regular events */
-				if (strtok_s(msg, &dmaxLen, " ", &p2str) != NULL)
+				char *localMsg = strdup(msg);
+
+				if (localMsg == NULL)
+				{
+					console_printf("%s; strdup failed ==> Exit!!!\n", __FUNCTION__);
+					return (int)DWPAL_FAILURE;
+				}
+
+				if (strtok_s(localMsg, &dmaxLen, " ", &p2str) != NULL)
 				{
 					vapName = strtok_s(NULL, &dmaxLen, " ", &p2str);
 					console_printf("%s; vapName= '%s'\n", __FUNCTION__, vapName);
@@ -1954,6 +1963,8 @@ static int dwpalOneShotEventCallback(char *radioName, char *opCode, char *msg, s
 						}
 					}
 				}
+
+				free((void *)localMsg);
 			}
 			else
 			{
@@ -2651,11 +2662,11 @@ static void dwpal_cli_readline_callback(char *strLine)
 					}
 					else
 					{
-						snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s", hostapCmdOpcode);
+						snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s", hostapCmdOpcode);
 
 						while ( (field = strtok_s(NULL, &dmaxLen, " ", &p2str)) != NULL )
 						{
-							snprintf(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s", cmd, field);
+							snprintf_s(cmd, DWPAL_TO_HOSTAPD_MSG_LENGTH, "%s %s", cmd, field);
 						}
 
 						if (isDwpalExtenderMode)
